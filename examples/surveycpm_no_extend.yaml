@@ -1,0 +1,301 @@
+# SurveyCPM - Automated Survey Paper Generation (NO_EXTEND Mode)
+# This pipeline implements OneSurveyManager with no_extend=True
+# 
+# Workflow in no_extend mode:
+# 1. search (cursor="outline") -> analyst-init_plan -> search (cursor="section-1")
+# 2. search (cursor="section-X") -> write -> search (cursor="section-X+1") [repeat until all sections done]
+# 3. When all sections complete (cursor=None):
+#    - If extend_time < 12: analyst-extend_plan (can extend or nop)
+#    - If extend_time >= 12: done
+#
+# Key behaviors:
+# - In no_extend mode, analyst-extend_plan ONLY runs AFTER all basic sections are written
+# - Parse failure handling: If parsing fails, state remains unchanged, step increments
+#   (Corresponds to OneSurveyManager.state_manager() lines 888-895)
+# - Each custom parsing function outputs parse_success_ls and handles state preservation
+
+# MCP Server
+servers:
+  benchmark: servers/benchmark
+  generation: servers/generation
+  retriever: servers/retriever
+  surveycpm: servers/surveycpm
+  router: servers/router
+  custom: servers/custom
+  evaluation: servers/evaluation
+
+# MCP Client Pipeline
+pipeline:
+# ==================== Initialization ====================
+- benchmark.get_data:
+    output:
+      q_ls: instruction_ls
+
+- retriever.retriever_init
+
+- generation.generation_init
+
+# Initialize survey state 
+# Initial: now_state="search", cursor="outline", survey={}, step=0, extend_time=0
+# Settings: no_check=True, no_extend=True, max_step=140
+- surveycpm.surveycpm_state_init:
+    input:
+      instruction_ls: instruction_ls
+    output:
+      state_ls: state_ls         # Initial: ["search", "search", ...]
+      cursor_ls: cursor_ls       # Initial: ["outline", "outline", ...]
+      survey_ls: survey_ls       # Initial: [{}, {}, ...]
+      retrieved_info_ls: retrieved_info_ls  # Initial: ["", "", ...]
+      step_ls: step_ls           # Initial: [0, 0, ...]
+      extend_time_ls: extend_time_ls  # Initial: [0, 0, ...]
+      no_check_ls: no_check_ls   # [True, True, ...]
+      no_extend_ls: no_extend_ls # [True, True, ...]
+
+# ==================== Main Survey Generation Loop ====================
+- loop:
+    times: 140  # max_step from OneSurveyManager
+    steps:
+    
+    # ---------- State Machine: Route to appropriate handler ----------
+    - branch:
+        router:
+        - surveycpm.surveycpm_state_router:
+            input:
+              state_ls: state_ls
+        branches:
+          
+          # ===== STATE: search =====
+          # Purpose: Generate search keywords and retrieve information
+          # Next state: 
+          #   - If cursor="outline": analyst-init_plan
+          #   - Else: write
+          search:
+          - surveycpm.surveycpm_search:
+              input:
+                instruction_ls: instruction_ls
+                survey_ls: survey_ls
+                cursor_ls: cursor_ls
+              output:
+                prompt_ls: search_prompt_ls
+          
+          - generation.generate:
+              input:
+                prompt_ls: search_prompt_ls
+              output:
+                ans_ls: search_response_ls
+          
+          # Parse response and extract keywords
+          - surveycpm.surveycpm_parse_search_response:
+              input:
+                response_ls: search_response_ls
+              output:
+                keywords_ls: keywords_ls
+                parse_success_ls: parse_success_ls
+          
+          # Search with keywords
+          - retriever.retriever_search:
+              input:
+                query_list: keywords_ls
+              output:
+                ret_psg: ret_psg
+          
+          # Process search results and determine next state
+          # (Corresponds to OneSurveyManager.interact_with_search_engine() lines 848-872
+          #  and state_manager() lines 897-905, 981-983)
+          # If parse failed OR search failed: state stays "search", cursor unchanged
+          # If parse and search succeed:
+          #   - Store retrieved info and bibkeys
+          #   - If cursor="outline": next_state="analyst-init_plan", cursor unchanged  
+          #   - Else: next_state="write", cursor unchanged
+          # Note: Cursor update happens BEFORE entering "search" state
+          - surveycpm.surveycpm_after_search:
+              input:
+                ret_psg: ret_psg
+                cursor_ls: cursor_ls
+                parse_success_ls: parse_success_ls
+              output:
+                retrieved_info_ls: retrieved_info_ls
+                state_ls: state_ls
+          
+          # ===== STATE: analyst-init_plan =====
+          # Purpose: Create initial survey outline with main sections
+          # Next state: search (cursor moves to "section-1")
+          analyst-init_plan:
+          - surveycpm.surveycpm_init_plan:
+              input:
+                instruction_ls: instruction_ls
+                retrieved_info_ls: retrieved_info_ls
+              output:
+                prompt_ls: init_plan_prompt_ls
+          
+          - generation.generate:
+              input:
+                prompt_ls: init_plan_prompt_ls
+              output:
+                ans_ls: init_plan_response_ls
+          
+          # Parse init_plan response and create survey structure
+          # If parse failed: state unchanged, cursor unchanged
+          # If parse success: 
+          #   - Creates survey with title and sections
+          #   - state="search"
+          #   - cursor updated via _check_progress_postion (becomes "section-1")
+          - surveycpm.surveycpm_after_init_plan:
+              input:
+                response_ls: init_plan_response_ls
+                survey_ls: survey_ls
+              output:
+                survey_ls: survey_ls
+                state_ls: state_ls
+                cursor_ls: cursor_ls
+                parse_success_ls: parse_success_ls
+          
+          # ===== STATE: write =====
+          # Purpose: Write content for current section
+          # Next state: search (in no_extend mode, always goes to search after write)
+          # Cursor update: moves to next section needing content
+          write:
+          - surveycpm.surveycpm_write:
+              input:
+                instruction_ls: instruction_ls
+                survey_ls: survey_ls
+                cursor_ls: cursor_ls
+                retrieved_info_ls: retrieved_info_ls
+              output:
+                prompt_ls: write_prompt_ls
+          
+          - generation.generate:
+              input:
+                prompt_ls: write_prompt_ls
+              output:
+                ans_ls: write_response_ls
+          
+          # Parse write response and update survey content
+          # If parse failed: state unchanged, cursor unchanged, survey unchanged
+          # If parse success in no_extend mode (no_check=True, no_extend=True):
+          #   - Update survey with content at cursor position
+          #   - state="search"
+          #   - cursor updated via _check_progress_postion (moves to next section)
+          #   (Corresponds to OneSurveyManager.state_manager() lines 934-936)
+          - surveycpm.surveycpm_after_write:
+              input:
+                response_ls: write_response_ls
+                survey_ls: survey_ls
+                cursor_ls: cursor_ls
+                no_check_ls: no_check_ls
+                no_extend_ls: no_extend_ls
+              output:
+                survey_ls: survey_ls
+                state_ls: state_ls
+                cursor_ls: cursor_ls
+                parse_success_ls: parse_success_ls
+          
+          # ===== STATE: analyst-extend_plan =====
+          # Purpose: Decide whether to extend sections with subsections
+          # This state is ONLY reached when:
+          #   - cursor is None (all basic sections complete)
+          #   - extend_time < 12
+          # Actions: "extend-plan" or "nop"
+          # Next state:
+          #   - If extend-plan: search (cursor moves to first extended position)
+          #   - If nop: search (extend_time=12, cursor stays None, will finish)
+          analyst-extend_plan:
+          - surveycpm.surveycpm_extend_plan:
+              input:
+                instruction_ls: instruction_ls
+                survey_ls: survey_ls
+                cursor_ls: cursor_ls
+                no_extend_ls: no_extend_ls
+              output:
+                prompt_ls: extend_prompt_ls
+          
+          - generation.generate:
+              input:
+                prompt_ls: extend_prompt_ls
+              output:
+                ans_ls: extend_response_ls
+          
+          # Parse extend response
+          # If parse failed: state unchanged, cursor unchanged, survey unchanged
+          # If parse success with action="extend-plan":
+          #   - Add subsections to specified position in survey
+          #   - state="search"
+          #   - cursor updated via _check_progress_postion (moves to new subsection)
+          #   (Corresponds to OneSurveyManager.state_manager() lines 963-971)
+          # If parse success with action="nop":
+          #   - state="search"
+          #   - extend_time=12 (prevents further extensions)
+          #   - cursor stays None (will trigger completion)
+          #   (Corresponds to OneSurveyManager.state_manager() lines 973-975)
+          - surveycpm.surveycpm_after_extend:
+              input:
+                response_ls: extend_response_ls
+                survey_ls: survey_ls
+                cursor_ls: cursor_ls
+                extend_time_ls: extend_time_ls
+              output:
+                survey_ls: survey_ls
+                state_ls: state_ls
+                cursor_ls: cursor_ls
+                extend_time_ls: extend_time_ls
+                parse_success_ls: parse_success_ls
+          
+          # ===== STATE: done =====
+          # Survey generation complete
+          done:
+          - loop:
+              break: true
+    
+    # Increment step counter
+    - surveycpm.surveycpm_increment_step:
+        input:
+          step_ls: step_ls
+        output:
+          step_ls: step_ls
+    
+    # Check completion and handle cursor=None case
+    # (Corresponds to OneSurveyManager.state_manager() lines 986-992, 994-999)
+    # When cursor is None (all sections done):
+    #   - If extend_time < 12 and no_extend=True: 
+    #       state="analyst-extend_plan", extend_time++, done=False
+    #   - Else: 
+    #       state="done", done=True
+    # If step >= max_step: 
+    #   - state="done", done=False (incomplete)
+    - surveycpm.surveycpm_check_completion:
+        input:
+          cursor_ls: cursor_ls
+          extend_time_ls: extend_time_ls
+          no_extend_ls: no_extend_ls
+          state_ls: state_ls
+          step_ls: step_ls
+        output:
+          state_ls: state_ls
+          extend_time_ls: extend_time_ls
+          done_ls: done_ls
+    
+    # Check if all surveys are done
+    - branch:
+        router:
+        - surveycpm.surveycpm_check_all_done:
+            input:
+              done_ls: done_ls
+        branches:
+          all_done:
+          - loop:
+              break: true
+          not_done: []
+
+# ==================== Finalization ====================
+# Extract final survey output
+- surveycpm.surveycpm_format_output:
+    input:
+      survey_ls: survey_ls
+      instruction_ls: instruction_ls
+    output:
+      ans_ls: final_survey_ls
+
+# Evaluate results
+- evaluation.evaluate:
+    input:
+      ans_ls: final_survey_ls

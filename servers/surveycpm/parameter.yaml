@@ -1,0 +1,8 @@
+# servers/surveycpm/parameter.yaml
+
+# Survey CPM Templates
+template: prompt/surveycpm_search.jinja
+init_plan_template: prompt/surveycpm_init_plan.jinja
+write_template: prompt/surveycpm_write.jinja
+extend_plan_template: prompt/surveycpm_extend_plan.jinja
+
